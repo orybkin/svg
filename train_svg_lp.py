@@ -11,6 +11,21 @@ import itertools
 import progressbar
 import numpy as np
 
+
+class Gaussian:
+    def __init__(self, mu, log_sigma):
+        self.mu = mu
+        self.log_sigma = log_sigma
+    
+    def nll(self, x):
+        # Negative log likelihood (probability)
+        return 0.5 * torch.pow((x - self.mu) / self.sigma, 2) + self.log_sigma + 0.5 * np.log(2 * np.pi)
+    
+    @property
+    def sigma(self):
+        return self.log_sigma.exp()
+    
+
 parser = argparse.ArgumentParser()
 parser.add_argument('--lr', default=0.002, type=float, help='learning rate')
 parser.add_argument('--beta1', default=0.9, type=float, help='momentum term for adam')
@@ -39,6 +54,7 @@ parser.add_argument('--beta', type=float, default=0.0001, help='weighting on KL 
 parser.add_argument('--model', default='dcgan', help='model type (dcgan | vgg)')
 parser.add_argument('--data_threads', type=int, default=5, help='number of data loading threads')
 parser.add_argument('--num_digits', type=int, default=2, help='number of digits for moving mnist')
+parser.add_argument('--learn_beta', type=int, default=0, help='learn_beta')
 parser.add_argument('--last_frame_skip', action='store_true', help='if true, skip connections go between frame t and frame t+t rather than last ground truth frame')
 
 
@@ -120,6 +136,9 @@ else:
     encoder.apply(utils.init_weights)
     decoder.apply(utils.init_weights)
 
+    log_sigma = nn.Parameter(torch.zeros(1).cuda()[0])
+    log_sigma.requires_grad_(bool(opt.learn_beta))
+    decoder.log_sigma = log_sigma
 frame_predictor_optimizer = opt.optimizer(frame_predictor.parameters(), lr=opt.lr, betas=(opt.beta1, 0.999))
 posterior_optimizer = opt.optimizer(posterior.parameters(), lr=opt.lr, betas=(opt.beta1, 0.999))
 prior_optimizer = opt.optimizer(prior.parameters(), lr=opt.lr, betas=(opt.beta1, 0.999))
@@ -127,7 +146,10 @@ encoder_optimizer = opt.optimizer(encoder.parameters(), lr=opt.lr, betas=(opt.be
 decoder_optimizer = opt.optimizer(decoder.parameters(), lr=opt.lr, betas=(opt.beta1, 0.999))
 
 # --------- loss functions ------------------------------------
-mse_criterion = nn.MSELoss()
+def mse_criterion(estimates, targets, log_sigma):
+    return Gaussian(estimates, log_sigma).nll(targets).sum() / opt.batch_size
+
+
 def kl_criterion(mu1, logvar1, mu2, logvar2):
     # KL( N(mu_1, sigma2_1) || N(mu_2, sigma2_2)) = 
     #   log( sqrt(
@@ -143,7 +165,7 @@ posterior.cuda()
 prior.cuda()
 encoder.cuda()
 decoder.cuda()
-mse_criterion.cuda()
+# mse_criterion.cuda()
 
 # --------- load a dataset ------------------------------------
 train_data, test_data = utils.load_dataset(opt)
@@ -316,8 +338,9 @@ def train(x):
         _, mu_p, logvar_p = prior(h)
         h_pred = frame_predictor(torch.cat([h, z_t], 1))
         x_pred = decoder([h_pred, skip])
-        mse += mse_criterion(x_pred, x[i])
+        mse += mse_criterion(x_pred, x[i], decoder.log_sigma)
         kld += kl_criterion(mu, logvar, mu_p, logvar_p)
+        
 
     loss = mse + kld*opt.beta
     loss.backward()
